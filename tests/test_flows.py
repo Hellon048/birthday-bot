@@ -14,10 +14,10 @@ from datetime import datetime, time, timedelta
 
 from aiogram import Bot
 from aiogram.client.session.base import BaseSession
-from aiogram.methods import (EditMessageReplyMarkup, EditMessageText, GetChat, GetMe,
+from aiogram.methods import (EditMessageReplyMarkup, EditMessageText, GetChat, GetFile, GetMe,
                              SendDocument, SendMessage, TelegramMethod)
 from aiogram.types import (CallbackQuery, Chat, ChatFullInfo, ChatMemberLeft, ChatMemberMember,
-                           ChatMemberUpdated, Message, Update, User)
+                           ChatMemberUpdated, Document, File, Message, Update, User)
 
 from app.config import load_config
 from app.db import DB
@@ -36,8 +36,11 @@ class AutoSession(BaseSession):
     async def close(self):
         pass
 
-    async def stream_content(self, *a, **k):  # pragma: no cover
-        yield b""
+    upload: str = ""
+
+    async def stream_content(self, *a, **k):
+        with open(self.upload, "rb") as f:
+            yield f.read()
 
     async def make_request(self, bot, method, timeout=None):
         self.log.append(method)
@@ -53,6 +56,8 @@ class AutoSession(BaseSession):
                            from_user=BOT_USER, text=getattr(method, "text", None) or "doc")
         if isinstance(method, EditMessageReplyMarkup):
             return True
+        if isinstance(method, GetFile):
+            return File(file_id=method.file_id, file_unique_id="u", file_path="docs/x.db")
         return True
 
 
@@ -295,6 +300,66 @@ async def scenario(dp, bot, db, n, session):
     check(not any(isinstance(m, SendDocument) and m.chat_id == MANAGER for m in session.log),
           "менеджеру экспорт недоступен")
 
+    legacy = os.environ.get("LEGACY_DB")
+    if not legacy:
+        print("(LEGACY_DB не задан — проверки загрузки базы пропущены)")
+        return await scheduler_check(db, n)
+    print("Загрузка базы через бота")
+    import sqlite3
+    upd = os.path.join(os.path.dirname(db.path), "legacy_upd.db")
+    shutil.copy(legacy, upd)
+    c = sqlite3.connect(upd)
+    c.execute("insert into contacts(full_name,company,birthday,responsible,is_active,created_at,updated_at) "
+              "values('Загруженный Партнёр','Бар (Омск)','2026-12-01','Новый Менеджер',1,'2026-10-28T12:00:00','2026-10-28T12:00:00')")
+    c.commit(); c.close()
+    session.upload = upd
+
+    def doc_msg(uid, name):
+        return Update(update_id=next(_ids), message=Message(
+            message_id=next(_ids), date=datetime.now(), chat=Chat(id=uid, type="private"), from_user=user(uid),
+            document=Document(file_id="f1", file_unique_id="u1", file_name=name, file_size=200000)))
+    session.log.clear()
+    await feed(doc_msg(MANAGER, "birthday_calendar.db"))
+    check(not await db.fetchone("SELECT 1 FROM persons WHERE full_name='Загруженный Партнёр'"),
+          "менеджер не может загрузить базу")
+    await feed(doc_msg(ADMIN, "birthday_calendar.db"))
+    preview = sent(session, ADMIN)[-1]
+    check("Пробный прогон" in preview and "партнёров: 1" in preview, "показан пробный прогон")
+    check(not await db.fetchone("SELECT 1 FROM persons WHERE full_name='Загруженный Партнёр'"),
+          "до подтверждения ничего не записано")
+    tok = [b for b in buttons(session) if b.startswith("imp:apply:")][0]
+    await feed(cb(ADMIN, tok))
+    row = await db.fetchone("SELECT p.*, u.name un FROM persons p JOIN users u ON u.id=p.responsible_id "
+                            "WHERE full_name='Загруженный Партнёр'")
+    check(row and row["un"] == "Новый Менеджер", "после подтверждения партнёр добавлен с новым ответственным")
+    linked = await db.user_by_tg(MANAGER)
+    check(linked and linked["id"] == om["id"], "привязка Telegram менеджера сохранилась")
+    check((await db.fetchone("SELECT characteristic FROM persons WHERE full_name='Тестова Анна Петровна'"))
+          ["characteristic"], "характеристика из бота сохранилась")
+    check(os.listdir(os.path.join(os.path.dirname(db.path), "backups")), "перед импортом сделан бэкап")
+    await feed(cb(ADMIN, tok))
+    check(sum("Импорт применён" in t for t in sent(session, ADMIN)) == 1, "повторное нажатие не применяет дважды")
+
+    print("Восстановление из копии")
+    session.log.clear()
+    await feed(cb(ADMIN, "s:backup"))
+    bk = [m for m in session.log if isinstance(m, SendDocument)]
+    check(bk, "резервная копия отправлена")
+    bdir = os.path.join(os.path.dirname(db.path), "backups")
+    first = sorted(f for f in os.listdir(bdir) if f.endswith("_import.db"))[0]
+    session.upload = os.path.join(bdir, first)
+    await feed(doc_msg(ADMIN, "backup.db"))
+    tok = [b for b in buttons(session) if b.startswith("imp:restore:")][0]
+    await feed(cb(ADMIN, tok))
+    check(not await db.fetchone("SELECT 1 FROM persons WHERE full_name='Загруженный Партнёр'"),
+          "восстановлено состояние до импорта")
+    check(await db.user_by_tg(ADMIN), "админ не потерял доступ после восстановления")
+
+    await scheduler_check(db, n)
+
+
+async def scheduler_check(db, n):
+    today = n.today()
     print("Планировщик")
     for k in ("morning", "post", "escalate", "digest"):
         await db.set_setting(f"last_{k}", "")

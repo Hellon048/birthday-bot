@@ -253,6 +253,13 @@ class Notifier:
                 await self.send(u["tg_id"], text + note, self.partner_kb(ev))
         await self.db.update_event(ev["id"], **{flag: 1})
 
+    async def backup(self) -> None:
+        """Ежедневная копия базы рядом с ней (хранится 14 штук)."""
+        import os
+        from .importer import make_backup
+        base = os.path.dirname(os.path.abspath(self.cfg.db_path))
+        await asyncio.to_thread(make_backup, self.cfg.db_path, os.path.join(base, "backups"), "auto", 14)
+
     # ---------- задачи по расписанию ----------
     async def process_person(self, p: dict, today: date | None = None) -> None:
         today = today or self.today()
@@ -379,6 +386,7 @@ class Scheduler:
             ("digest", cfg.morning_time, now.weekday() == cfg.digest_weekday, self.n.digest),
             ("post", cfg.post_time, True, self.n.post_today),
             ("escalate", cfg.escalate_time, True, self.n.escalate),
+            ("backup", cfg.escalate_time, True, self.n.backup),
         ]
         for name, at, cond, fn in jobs:
             if not cond or now.time() < at:

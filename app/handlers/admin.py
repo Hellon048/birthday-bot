@@ -1,18 +1,23 @@
 """Доступы (приглашения по ссылке), настройки."""
 from __future__ import annotations
 
+import asyncio
+import os
+import re
+from datetime import datetime
 from urllib.parse import quote
 
 from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, FSInputFile, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from ..access import Private, Role
 from ..config import Config
 from ..db import DB
 from ..notifier import Notifier
+from ..importer import NotLegacyDB, detect, make_backup, merge_legacy, restore_backup
 from ..ui import BTN_SETTINGS, BTN_USERS, MENU_BUTTONS, ROLE_LABEL, cancel_kb, h, main_menu
 
 router = Router(name="admin")
@@ -240,6 +245,8 @@ async def settings_view(db: DB, cfg: Config, notifier: Notifier):
     kb.button(text=f"29.02 → {'01.03' if feb == '28.02' else '28.02'}", callback_data="s:feb29")
     kb.button(text="🧪 Тест генерации", callback_data="s:test")
     kb.button(text="▶️ Проверить дни рождения сейчас", callback_data="s:run")
+    kb.button(text="📥 Загрузить базу (.db)", callback_data="s:upload")
+    kb.button(text="💾 Резервная копия", callback_data="s:backup")
     kb.adjust(1)
     return text, kb.as_markup()
 
@@ -292,3 +299,94 @@ async def settings_run(cb: CallbackQuery, notifier: Notifier):
     await cb.answer("Запускаю проверку…")
     await notifier.morning()
     await cb.message.answer("Готово: напоминания и черновики разосланы (уже отправленное не дублируется).")
+
+
+# ---------- загрузка базы и резервные копии ----------
+def _dirs(cfg: Config) -> tuple[str, str]:
+    base = os.path.dirname(os.path.abspath(cfg.db_path))
+    return os.path.join(base, "uploads"), os.path.join(base, "backups")
+
+
+def _upload_path(cfg: Config, token: str) -> str | None:
+    if not re.fullmatch(r"\d{8}_\d{6}", token):
+        return None
+    return os.path.join(_dirs(cfg)[0], f"{token}.db")
+
+
+@router.callback_query(F.data == "s:upload")
+async def upload_help(cb: CallbackQuery):
+    await cb.message.answer(
+        "Отправьте сюда файл базы документом:\n"
+        "• <b>старая база</b> (birthday_calendar.db) — данные сольются с ботом: новые люди добавятся, "
+        "изменённые обновятся, правки из бота не затрутся. Перед применением покажу, что изменится;\n"
+        "• <b>резервная копия бота</b> — можно восстановить всё целиком.")
+    await cb.answer()
+
+
+@router.callback_query(F.data == "s:backup")
+async def backup_send(cb: CallbackQuery, cfg: Config):
+    await cb.answer("Готовлю копию…")
+    path = await asyncio.to_thread(make_backup, cfg.db_path, _dirs(cfg)[1], "manual", 5)
+    await cb.message.answer_document(
+        FSInputFile(path, filename=os.path.basename(path)),
+        caption="💾 Резервная копия. В ней персональные данные — не пересылайте и не храните в открытых местах.")
+
+
+@router.message(F.document)
+async def upload_db(message: Message, bot: Bot, cfg: Config, state: FSMContext):
+    doc = message.document
+    if not (doc.file_name or "").lower().endswith((".db", ".sqlite", ".sqlite3")):
+        return await message.answer("Нужен файл базы .db")
+    if (doc.file_size or 0) > 20 * 1024 * 1024:
+        return await message.answer("Файл больше 20 МБ — Telegram не даст боту его скачать.")
+    await state.clear()
+    token = f"{datetime.now():%Y%m%d_%H%M%S}"
+    path = _upload_path(cfg, token)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    await bot.download(doc, destination=path)
+    try:
+        kind = await asyncio.to_thread(detect, path)
+        kb = InlineKeyboardBuilder()
+        if kind == "legacy":
+            rep = await asyncio.to_thread(merge_legacy, path, cfg.db_path, False)
+            kb.button(text="✅ Применить", callback_data=f"imp:apply:{token}")
+            text = "🔎 <b>Пробный прогон</b> — пока ничего не записано.\n\n" + h(rep.text())
+        else:
+            kb.button(text="♻️ Восстановить из копии", callback_data=f"imp:restore:{token}")
+            text = ("Это резервная копия бота. Восстановление <b>заменит всё</b>: людей, доступы, "
+                    "группы и историю. Текущее состояние я сначала сохраню в копию.")
+        kb.button(text="✖️ Отмена", callback_data=f"imp:cancel:{token}")
+        kb.adjust(1)
+        await message.answer(text[:4000], reply_markup=kb.as_markup())
+    except NotLegacyDB as e:
+        os.remove(path)
+        await message.answer(f"⚠️ {h(e)}")
+
+
+@router.callback_query(F.data.startswith("imp:"))
+async def upload_action(cb: CallbackQuery, cfg: Config, notifier: Notifier, db: DB):
+    _, action, token = cb.data.split(":")
+    path = _upload_path(cfg, token)
+    if not path or not os.path.exists(path):
+        return await cb.answer("Файл уже обработан или устарел — отправьте заново", show_alert=True)
+    await cb.message.edit_reply_markup()
+    if action == "cancel":
+        os.remove(path)
+        return await cb.answer("Отменено")
+    await cb.answer("Выполняю…")
+    backup = await asyncio.to_thread(make_backup, cfg.db_path, _dirs(cfg)[1], "import", 10)
+    try:
+        if action == "apply":
+            rep = await asyncio.to_thread(merge_legacy, path, cfg.db_path, True)
+            text = "✅ <b>Импорт применён.</b>\n\n" + h(rep.text())
+        else:
+            await asyncio.to_thread(restore_backup, path, cfg.db_path)
+            await db.ensure_admins(cfg.admin_ids)  # админы из .env не должны потерять доступ
+            text = "✅ База восстановлена из копии."
+    except Exception as e:
+        return await cb.message.answer(f"⚠️ Ошибка: {h(e)}. База не изменена.")
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+    await cb.message.answer(text[:4000] + f"\n\nПредыдущее состояние сохранено: {os.path.basename(backup)}")
+    await notifier.morning()  # новые люди с близким ДР получат напоминания сразу
