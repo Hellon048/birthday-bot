@@ -14,7 +14,7 @@ from datetime import datetime, time, timedelta
 
 from aiogram import Bot
 from aiogram.client.session.base import BaseSession
-from aiogram.methods import (EditMessageReplyMarkup, EditMessageText, GetChat, GetFile, GetMe,
+from aiogram.methods import (EditMessageReplyMarkup, EditMessageText, GetChat, GetChatMember, GetFile, GetMe,
                              SendDocument, SendMessage, TelegramMethod)
 from aiogram.types import (CallbackQuery, Chat, ChatFullInfo, ChatMemberLeft, ChatMemberMember,
                            ChatMemberUpdated, Document, File, Message, Update, User)
@@ -37,6 +37,7 @@ class AutoSession(BaseSession):
         pass
 
     upload: str = ""
+    can_post: bool = True
 
     async def stream_content(self, *a, **k):
         with open(self.upload, "rb") as f:
@@ -48,13 +49,18 @@ class AutoSession(BaseSession):
         if isinstance(method, GetMe):
             return BOT_USER
         if isinstance(method, GetChat):
-            return ChatFullInfo.model_construct(id=method.chat_id, type="supergroup", title="Тест-группа")
+            kind = "channel" if method.chat_id in (-100321, -100322) else "supergroup"
+            return ChatFullInfo.model_construct(id=method.chat_id, type=kind, title="Тест-чат")
         if isinstance(method, (SendMessage, EditMessageText, SendDocument)):
             cid = getattr(method, "chat_id", None) or ADMIN
             return Message(message_id=next(_ids), date=now, chat=Chat(id=cid, type="private"),
                            from_user=BOT_USER, text=getattr(method, "text", None) or "doc")
         if isinstance(method, EditMessageReplyMarkup):
             return True
+        if isinstance(method, GetChatMember):
+            from aiogram.types import ChatMemberAdministrator
+            return ChatMemberAdministrator.model_construct(
+                status="administrator", user=BOT_USER, can_post_messages=self.can_post)
         if isinstance(method, GetFile):
             return File(file_id=method.file_id, file_unique_id="u", file_path="docs/x.db")
         return True
@@ -218,7 +224,7 @@ async def scenario(dp, bot, db, n, session):
         old_chat_member=ChatMemberLeft(user=BOT_USER), new_chat_member=ChatMemberMember(user=BOT_USER))))
     c999 = await db.chat(-999)
     check(not c999["is_active"], "посторонний не может прикрепить группу")
-    check(any("Меня добавили в группу «Чужая»" in t for t in sent(session, ADMIN)), "бот не ушёл молча, а спросил админа")
+    check(any("Меня добавили в «Чужая»" in t for t in sent(session, ADMIN)), "бот не ушёл молча, а спросил админа")
     await feed(cb(ADMIN, "g:accept:-999"))
     check((await db.chat(-999))["is_active"], "админ прикрепил группу кнопкой")
     await feed(cb(ADMIN, "g:off:-999"))
@@ -242,6 +248,34 @@ async def scenario(dp, bot, db, n, session):
     check((await db.chat(-556))["is_active"], "/start после ссылки «добавить в группу» прикрепил группу")
     for cid in (-555, -556):
         await feed(cb(ADMIN, f"g:off:{cid}"))
+
+    print("Каналы")
+    from aiogram.types import ChatShared
+    def shared(req, cid, title):
+        return Update(update_id=next(_ids), message=Message(
+            message_id=next(_ids), date=datetime.now(), chat=Chat(id=ADMIN, type="private"),
+            from_user=user(ADMIN), chat_shared=ChatShared(request_id=req, chat_id=cid, title=title)))
+    await feed(cb(ADMIN, "g:add"))
+    kbm = [m for m in session.log if isinstance(m, SendMessage) and hasattr(m.reply_markup, "keyboard")][-1]
+    check(any(b.request_chat and b.request_chat.chat_is_channel for row in kbm.reply_markup.keyboard for b in row),
+          "есть кнопка «Выбрать канал»")
+    session.can_post = False
+    await feed(shared(38, -100321, "Напоминалкин-канал"))
+    check(not await db.chat(-100321) and "Публикация сообщений" in sent(session, ADMIN)[-1],
+          "канал без права публикации не прикрепляется, объяснено почему")
+    session.can_post = True
+    await feed(shared(38, -100321, "Напоминалкин-канал"))
+    check((await db.chat(-100321))["is_active"], "канал прикреплён через «Выбрать канал»")
+    await feed(cb(ADMIN, "g:off:-100321"))
+    from aiogram.types import ChatMemberAdministrator
+    await dp.feed_update(bot, Update(update_id=next(_ids), my_chat_member=ChatMemberUpdated(
+        chat=Chat(id=-100322, type="channel", title="Канал2"), from_user=user(ADMIN), date=datetime.now(),
+        old_chat_member=ChatMemberLeft(user=BOT_USER),
+        new_chat_member=ChatMemberAdministrator(user=BOT_USER, **{
+            f: False for f, info in ChatMemberAdministrator.model_fields.items()
+            if info.is_required() and f not in ("user", "status")} | {"can_post_messages": True}))))
+    check((await db.chat(-100322))["is_active"], "канал прикрепился при добавлении бота админом канала")
+    await feed(cb(ADMIN, "g:off:-100322"))
 
     print("Модерация и публикация")
     await feed(cb(ADMIN, f"ev:re:{ev['id']}"))

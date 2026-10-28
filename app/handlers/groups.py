@@ -18,10 +18,28 @@ from ..ui import BTN_CANCEL, BTN_GROUPS, h, main_menu
 
 log = logging.getLogger(__name__)
 router = Router(name="groups")
-REQUEST_ID = 37
+REQUEST_ID = 37          # выбор группы
+REQUEST_CHANNEL_ID = 38  # выбор канала
 
 
 GROUP_TYPES = ("group", "supergroup")
+TARGET_TYPES = GROUP_TYPES + ("channel",)  # куда можно публиковать поздравления
+
+
+async def can_post(bot: Bot, chat_id: int) -> tuple[bool, str]:
+    """Может ли бот писать в чат. В канале нужен админ с правом публикации."""
+    try:
+        m = await bot.get_chat_member(chat_id, (await bot.me()).id)
+    except TelegramAPIError as e:
+        return False, f"бот не видит чат ({e.message})"
+    if m.status in ("left", "kicked"):
+        return False, "бота нет в чате"
+    chat = await bot.get_chat(chat_id)
+    if chat.type == "channel" and not (m.status == "creator" or getattr(m, "can_post_messages", False)):
+        return False, "в канале у бота нет права «Публикация сообщений» (Управление публикациями)"
+    if m.status == "restricted" and not getattr(m, "can_send_messages", True):
+        return False, "боту запрещено писать в группе"
+    return True, ""
 
 
 def _staff(u: dict | None) -> bool:
@@ -33,7 +51,7 @@ async def attach(db: DB, notifier: Notifier, chat_id: int, title: str, user: dic
     log.info("Группа %s «%s» прикреплена пользователем %s", chat_id, title, user["name"])
     if user["tg_id"]:
         await notifier.send(user["tg_id"],
-                            f"✅ Группа «{h(title)}» прикреплена. Сюда будут приходить поздравления "
+                            f"✅ «{h(title)}» прикреплена. Сюда будут приходить поздравления "
                             "сотрудников. Фильтр по отделам — в «💬 Группы».")
 
 
@@ -47,7 +65,7 @@ async def ask_admins(db: DB, notifier: Notifier, chat_id: int, title: str, who: 
     kb.button(text="🚪 Выйти из группы", callback_data=f"g:leave:{chat_id}")
     for u in await db.users(roles=["admin", "hr"], only_linked=True):
         await notifier.send(u["tg_id"],
-                            f"Меня добавили в группу «{h(title)}» ({h(who)}). Прикрепить её для "
+                            f"Меня добавили в «{h(title)}» ({h(who)}). Прикрепить для "
                             "поздравлений сотрудников?", kb.as_markup())
 
 
@@ -57,7 +75,7 @@ async def bot_added(event: ChatMemberUpdated, db: DB, notifier: Notifier):
     fu = event.from_user
     log.info("Бота добавили в %s %s «%s», добавил %s (@%s)",
              event.chat.type, event.chat.id, event.chat.title, fu.id, fu.username)
-    if event.chat.type not in GROUP_TYPES:
+    if event.chat.type not in TARGET_TYPES:
         return
     title = event.chat.title or str(event.chat.id)
     adder = await db.user_by_tg(fu.id)
@@ -148,26 +166,32 @@ async def group_add(cb: CallbackQuery, bot: Bot):
     me = await bot.me()
     kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True, keyboard=[
         [KeyboardButton(text="📎 Выбрать группу", request_chat=KeyboardButtonRequestChat(
-            request_id=REQUEST_ID, chat_is_channel=False, request_title=True))],
+            request_id=REQUEST_ID, chat_is_channel=False, request_title=True)),
+         KeyboardButton(text="📢 Выбрать канал", request_chat=KeyboardButtonRequestChat(
+            request_id=REQUEST_CHANNEL_ID, chat_is_channel=True, request_title=True))],
         [KeyboardButton(text=BTN_CANCEL)],
     ])
     invite = f"https://t.me/{me.username}?startgroup=bday"
     ikb = InlineKeyboardBuilder()
     ikb.button(text="➕ Добавить бота в группу", url=invite)
+    ikb.button(text="📢 Добавить бота в канал",
+               url=f"https://t.me/{me.username}?startchannel&admin=post_messages")
+    ikb.adjust(1)
     await cb.message.answer(
         "Два способа:\n"
         "1. «➕ Добавить бота в группу» (кнопка ниже) — выберите группу, бот прикрепится сам.\n"
-        "2. Если бот уже в группе — «📎 Выбрать группу» внизу экрана или команда "
-        "<code>/bind</code> в самой группе.",
+        "2. Если бот уже в группе или канале — «📎 Выбрать группу» / «📢 Выбрать канал» "
+        "внизу экрана (или <code>/bind</code> в самой группе).\n\n"
+        "Для канала бот должен быть админом с правом «Публикация сообщений».",
         reply_markup=kb)
-    await cb.message.answer("Добавить бота в группу:", reply_markup=ikb.as_markup())
+    await cb.message.answer("Добавить бота:", reply_markup=ikb.as_markup())
     await cb.answer()
 
 
 @staff.message(F.chat_shared)
 async def group_shared(message: Message, bot: Bot, db: DB, me: dict):
     shared = message.chat_shared
-    if shared.request_id != REQUEST_ID:
+    if shared.request_id not in (REQUEST_ID, REQUEST_CHANNEL_ID):
         return
     log.info("Выбрана группа %s «%s»", shared.chat_id, shared.title)
     try:
@@ -181,8 +205,12 @@ async def group_shared(message: Message, bot: Bot, db: DB, me: dict):
         await message.answer("Меня ещё нет в этой группе.", reply_markup=main_menu(me["role"]))
         return await message.answer("Добавьте бота — после этого группа прикрепится сама:",
                                     reply_markup=ikb.as_markup())
+    ok, why = await can_post(bot, shared.chat_id)
+    if not ok:
+        return await message.answer(f"⚠️ «{h(title)}» не прикреплена: {h(why)}. Исправьте и выберите снова.",
+                                    reply_markup=main_menu(me["role"]))
     await db.upsert_chat(shared.chat_id, title, me["id"])
-    await message.answer(f"✅ Группа «{h(title)}» прикреплена.", reply_markup=main_menu(me["role"]))
+    await message.answer(f"✅ «{h(title)}» прикреплена.", reply_markup=main_menu(me["role"]))
     text, kb = await groups_view(db)
     await message.answer(text, reply_markup=kb)
 
