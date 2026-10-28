@@ -110,13 +110,15 @@ DEFAULT_SETTINGS = {
 EMPLOYEE_FIELDS = {
     "full_name": "ФИО", "birthday": "Дата рождения", "position": "Должность",
     "department": "Отдел", "characteristic": "Характеристика от HR",
-    "gift_format": "Формат (премия и т.п.)", "phone": "Телефон", "comment": "Комментарий",
+    "gift_format": "Формат (премия и т.п.)", "phone": "Телефон", "email": "Email",
+    "comment": "Комментарий",
 }
 PARTNER_FIELDS = {
     "full_name": "ФИО", "birthday": "Дата рождения", "company": "Компания (город)",
     "category": "Категория", "responsible_id": "Ответственный",
-    "gift_format": "Что дарим", "congrat_method": "Как поздравляем",
-    "phone": "Телефон", "messenger": "Мессенджер", "comment": "Комментарий",
+    "contact_type": "Тип (клиент/партнёр)", "gift_format": "Что дарим",
+    "congrat_method": "Как поздравляем", "congratulator": "Кто поздравляет",
+    "phone": "Телефон", "messenger": "Мессенджер", "email": "Email", "comment": "Комментарий",
 }
 
 

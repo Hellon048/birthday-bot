@@ -358,6 +358,44 @@ async def scenario(dp, bot, db, n, session):
     check(not any(isinstance(m, SendDocument) and m.chat_id == MANAGER for m in session.log),
           "менеджеру экспорт недоступен")
 
+    print("Админка: пользователи")
+    hr = await db.fetchone("SELECT * FROM users WHERE name='Петрова Ольга'")
+    await feed(cb(ADMIN, f"u:rename:{hr['id']}"))
+    await feed(msg(ADMIN, "Петрова Ольга Ивановна"))
+    check((await db.user(hr["id"]))["name"] == "Петрова Ольга Ивановна", "имя пользователя изменено")
+    victim = await db.fetchone(
+        "SELECT u.id, COUNT(p.id) c FROM users u JOIN persons p ON p.responsible_id=u.id "
+        "WHERE u.tg_id IS NULL GROUP BY u.id LIMIT 1")
+    await feed(cb(ADMIN, f"u:del:{victim['id']}"))
+    check("останутся без ответственного" in sent(session, ADMIN)[-1], "при удалении предупреждение про партнёров")
+    await feed(cb(ADMIN, f"u:delok:{victim['id']}"))
+    check(not await db.user(victim["id"]), "пользователь удалён")
+    check(not await db.fetchone("SELECT 1 FROM persons WHERE responsible_id=?", (victim["id"],)),
+          "его партнёры остались, но без ответственного")
+    admin_row = await db.user_by_tg(ADMIN)
+    await feed(cb(MANAGER, f"u:delok:{admin_row['id']}"))
+    check(await db.user_by_tg(ADMIN), "менеджер не может удалять пользователей")
+
+    print("Админка: люди")
+    await feed(cb(ADMIN, "ls:employee:0"))
+    check(sent(session, ADMIN)[-1].startswith("<b>Сотрудники</b>") and "ls:employee:1" in buttons(session),
+          "список сотрудников с пагинацией")
+    await feed(cb(MANAGER, "ls:employee:0"))
+    mine_ids = {r["id"] for r in await db.persons(responsible_id=om["id"])}
+    ids = [int(b.split(":")[2]) for b in buttons(session) if b.startswith("p:view:")]
+    check(ids and all(i in mine_ids for i in ids), "менеджер видит в списке только своих")
+    pr = await db.fetchone("SELECT * FROM persons WHERE full_name='Сергей (закупщик)'")
+    await feed(cb(MANAGER, f"p:r7:{pr['id']}"))
+    check((await db.person(pr["id"]))["remind_7"] == 0, "напоминание за 7 дней выключено")
+    await feed(cb(MANAGER, f"p:f:{pr['id']}:email"))
+    await feed(msg(MANAGER, "sergey@bar.ru"))
+    check((await db.person(pr["id"]))["email"] == "sergey@bar.ru", "email изменён")
+    await feed(cb(MANAGER, f"p:delok:{pr['id']}"))
+    check(await db.person(pr["id"]), "менеджер не может удалить навсегда")
+    await feed(cb(ADMIN, f"p:del:{pr['id']}"))
+    await feed(cb(ADMIN, f"p:delok:{pr['id']}"))
+    check(not await db.person(pr["id"]), "админ удалил человека")
+
     legacy = os.environ.get("LEGACY_DB")
     if not legacy:
         print("(LEGACY_DB не задан — проверки загрузки базы пропущены)")

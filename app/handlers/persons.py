@@ -41,6 +41,13 @@ PROMPTS = {
     ("*", "responsible_id"): "Кто отвечает за поздравление?",
     ("*", "gift_format"): "Что дарим / как поздравляем — выберите или напишите",
     ("*", "comment"): "Комментарий (что важно знать менеджеру)",
+    ("*", "email"): "Email",
+    ("*", "phone"): "Телефон",
+    ("*", "messenger"): "Мессенджер (Telegram, WhatsApp, @username…)",
+    ("*", "category"): "Категория (ключевой, постоянный…)",
+    ("*", "contact_type"): "Тип: клиент или партнёр",
+    ("*", "congrat_method"): "Как поздравляем (сообщение, звонок, открытка…)",
+    ("*", "congratulator"): "Кто поздравляет (ОП, руководитель…)",
 }
 
 
@@ -274,9 +281,56 @@ async def upcoming(message: Message, db: DB, me: dict, notifier: Notifier, state
 
 # ================= поиск =================
 @router.message(F.text == BTN_SEARCH)
-async def search_start(message: Message, state: FSMContext):
+async def search_start(message: Message, state: FSMContext, me: dict):
     await state.set_state(SearchSG.query)
     await message.answer("Введите часть ФИО или компании:", reply_markup=cancel_kb())
+    kb = InlineKeyboardBuilder()
+    if is_staff(me):
+        kb.button(text="👤 Все сотрудники", callback_data="ls:employee:0")
+        kb.button(text="🤝 Все партнёры", callback_data="ls:partner:0")
+        kb.button(text="🗄 Архив", callback_data="ls:archive:0")
+    else:
+        kb.button(text="🤝 Мои партнёры", callback_data="ls:partner:0")
+    kb.adjust(2)
+    await message.answer("…или откройте список:", reply_markup=kb.as_markup())
+
+
+PAGE = 20
+
+
+@router.callback_query(F.data.startswith("ls:"))
+async def list_people(cb: CallbackQuery, db: DB, me: dict, state: FSMContext):
+    _, what, page = cb.data.split(":")
+    page = int(page)
+    mine = None if is_staff(me) else me["id"]
+    if what == "archive" and is_staff(me):
+        rows = await db.persons(active=False)
+        title = "Архив"
+    else:
+        what = "partner" if what != "employee" or not is_staff(me) else what
+        rows = await db.persons(kind=what, responsible_id=mine)
+        title = "Сотрудники" if what == "employee" else ("Партнёры" if mine is None else "Мои партнёры")
+    await state.clear()
+    total = len(rows)
+    chunk = rows[page * PAGE:(page + 1) * PAGE]
+    kb = InlineKeyboardBuilder()
+    for p in chunk:
+        kb.button(text=person_title(p)[:60], callback_data=f"p:view:{p['id']}")
+    nav = []
+    if page > 0:
+        nav.append(("⬅️", f"ls:{what}:{page - 1}"))
+    if (page + 1) * PAGE < total:
+        nav.append(("➡️", f"ls:{what}:{page + 1}"))
+    for t, d in nav:
+        kb.button(text=t, callback_data=d)
+    kb.adjust(*([1] * len(chunk)), len(nav) or 1)
+    pages = max(1, -(-total // PAGE))
+    text = f"<b>{title}</b>: {total} · стр. {page + 1}/{pages}" if total else f"<b>{title}</b>: пусто"
+    if cb.message.text and cb.message.text.startswith(title):
+        await cb.message.edit_text(text, reply_markup=kb.as_markup())
+    else:
+        await cb.message.answer(text, reply_markup=kb.as_markup())
+    await cb.answer()
 
 
 async def do_search(message: Message, db: DB, me: dict, q: str):
@@ -373,17 +427,58 @@ async def history(cb: CallbackQuery, db: DB, me: dict):
 
 @router.callback_query(F.data.startswith("p:edit:"))
 async def edit_menu(cb: CallbackQuery, db: DB, me: dict):
-    if not (p := await load(cb, db, me)):
-        return
+    if p := await load(cb, db, me):
+        await show_edit_menu(cb, p, me)
+
+
+async def show_edit_menu(cb: CallbackQuery, p: dict, me: dict):
     fields = EMPLOYEE_FIELDS if p["kind"] == "employee" else PARTNER_FIELDS
     kb = InlineKeyboardBuilder()
     for key, label in fields.items():
         if key == "responsible_id" and not is_staff(me):
             continue
         kb.button(text=label, callback_data=f"p:f:{p['id']}:{key}")
+    kb.button(text=f"За 7 дней: {'🔔' if p['remind_7'] else '🔕'}", callback_data=f"p:r7:{p['id']}")
+    kb.button(text=f"За 1 день: {'🔔' if p['remind_1'] else '🔕'}", callback_data=f"p:r1:{p['id']}")
+    if me["role"] == "admin":
+        kb.button(text="🗑 Удалить навсегда", callback_data=f"p:del:{p['id']}")
     kb.button(text="⬅️ Назад", callback_data=f"p:back:{p['id']}")
     kb.adjust(2)
     await cb.message.edit_reply_markup(reply_markup=kb.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("p:r7:") | F.data.startswith("p:r1:"))
+async def toggle_remind(cb: CallbackQuery, db: DB, me: dict):
+    if not (p := await load(cb, db, me)):
+        return
+    col = "remind_7" if cb.data.startswith("p:r7:") else "remind_1"
+    await db.update_person(p["id"], **{col: 0 if p[col] else 1})
+    await show_edit_menu(cb, await db.person(p["id"]), me)
+
+
+@router.callback_query(F.data.startswith("p:del:"))
+async def delete_ask(cb: CallbackQuery, db: DB, me: dict):
+    if not (p := await load(cb, db, me)) or me["role"] != "admin":
+        return await cb.answer("Только администратор", show_alert=True) if p else None
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🗑 Да, удалить", callback_data=f"p:delok:{p['id']}")
+    kb.button(text="⬅️ Нет", callback_data=f"p:back:{p['id']}")
+    kb.adjust(2)
+    await cb.message.edit_text(
+        f"Удалить <b>{h(p['full_name'])}</b> навсегда вместе с историей поздравлений?\n"
+        "Если человек просто уволился или вы больше не работаете — лучше «🗄 В архив».",
+        reply_markup=kb.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("p:delok:"))
+async def delete_ok(cb: CallbackQuery, db: DB, me: dict):
+    if not (p := await load(cb, db, me)) or me["role"] != "admin":
+        return
+    await db.execute("DELETE FROM events WHERE person_id=?", (p["id"],))
+    await db.execute("DELETE FROM persons WHERE id=?", (p["id"],))
+    await cb.message.edit_text(f"🗑 {h(p['full_name'])} удалён(а).")
     await cb.answer()
 
 

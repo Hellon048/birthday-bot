@@ -33,6 +33,10 @@ class SettingsSG(StatesGroup):
     company = State()
 
 
+class RenameSG(StatesGroup):
+    name = State()
+
+
 # ---------- список пользователей ----------
 async def users_view(db: DB):
     users = await db.users(only_active=False)
@@ -74,6 +78,7 @@ async def user_card(db: DB, uid: int, me: dict):
     kb = InlineKeyboardBuilder()
     if u["is_active"] and not u["tg_id"]:
         kb.button(text="🔗 Ссылка-приглашение", callback_data=f"u:link:{uid}")
+    kb.button(text="✏️ Изменить имя", callback_data=f"u:rename:{uid}")
     for r in ("admin", "hr", "manager"):
         if r != u["role"]:
             kb.button(text=f"Сделать: {ROLE_LABEL[r]}", callback_data=f"u:role:{uid}:{r}")
@@ -83,6 +88,8 @@ async def user_card(db: DB, uid: int, me: dict):
         kb.button(text="🚫 Отключить" if u["is_active"] else "✅ Включить", callback_data=f"u:act:{uid}")
     if u["tg_id"] and u["id"] != me["id"]:
         kb.button(text="🔓 Отвязать Telegram", callback_data=f"u:unlink:{uid}")
+    if u["id"] != me["id"]:
+        kb.button(text="🗑 Удалить", callback_data=f"u:del:{uid}")
     kb.button(text="⬅️ Назад", callback_data="u:list")
     kb.adjust(1)
     return "\n".join(lines), kb.as_markup()
@@ -390,3 +397,60 @@ async def upload_action(cb: CallbackQuery, cfg: Config, notifier: Notifier, db: 
             os.remove(path)
     await cb.message.answer(text[:4000] + f"\n\nПредыдущее состояние сохранено: {os.path.basename(backup)}")
     await notifier.morning()  # новые люди с близким ДР получат напоминания сразу
+
+
+@router.callback_query(F.data.startswith("u:rename:"))
+async def user_rename(cb: CallbackQuery, db: DB, state: FSMContext):
+    uid = int(cb.data.split(":")[2])
+    u = await db.user(uid)
+    await state.set_state(RenameSG.name)
+    await state.update_data(uid=uid)
+    await cb.message.answer(f"Новое имя для <b>{h(u['name'])}</b> (Фамилия Имя):", reply_markup=cancel_kb())
+    await cb.answer()
+
+
+@router.message(RenameSG.name, F.text, ~F.text.in_(MENU_BUTTONS))
+async def user_rename_set(message: Message, db: DB, state: FSMContext, me: dict):
+    uid = (await state.get_data())["uid"]
+    await state.clear()
+    await db.update_user(uid, name=" ".join(message.text.split())[:80])
+    await message.answer("Сохранено ✅", reply_markup=main_menu(me["role"]))
+    text, kb = await user_card(db, uid, me)
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("u:del:"))
+async def user_delete(cb: CallbackQuery, db: DB, cfg: Config, me: dict):
+    uid = int(cb.data.split(":")[2])
+    u = await db.user(uid)
+    if not u or u["id"] == me["id"]:
+        return await cb.answer("Нельзя", show_alert=True)
+    if u["tg_id"] in cfg.admin_ids:
+        return await cb.answer("Этот админ задан в .env (ADMIN_IDS) — уберите его оттуда", show_alert=True)
+    cnt = (await db.fetchone("SELECT COUNT(*) c FROM persons WHERE responsible_id=?", (uid,)))["c"]
+    warn = (f"\n\n⚠️ На нём {cnt} партнёров — они останутся без ответственного "
+            "(напоминания пойдут админам). Лучше сначала «🔁 Передать партнёров».") if cnt else ""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🗑 Да, удалить", callback_data=f"u:delok:{uid}")
+    kb.button(text="⬅️ Нет", callback_data=f"u:view:{uid}")
+    kb.adjust(2)
+    await cb.message.edit_text(f"Удалить <b>{h(u['name'])}</b> из бота?{warn}", reply_markup=kb.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("u:delok:"))
+async def user_delete_ok(cb: CallbackQuery, db: DB, cfg: Config, me: dict):
+    uid = int(cb.data.split(":")[2])
+    u = await db.user(uid)
+    if not u or u["id"] == me["id"] or u["tg_id"] in cfg.admin_ids:
+        return await cb.answer("Нельзя", show_alert=True)
+    for sql in ("UPDATE persons SET responsible_id=NULL WHERE responsible_id=?",
+                "UPDATE events SET done_by=NULL WHERE done_by=?",
+                "UPDATE chats SET added_by=NULL WHERE added_by=?",
+                "UPDATE invites SET created_by=NULL WHERE created_by=?",
+                "DELETE FROM invites WHERE user_id=?",
+                "DELETE FROM users WHERE id=?"):
+        await db.execute(sql, (uid,))
+    text, kb = await users_view(db)
+    await cb.message.edit_text(f"🗑 {h(u['name'])} удалён.\n\n" + text, reply_markup=kb)
+    await cb.answer()
