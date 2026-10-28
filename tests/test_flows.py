@@ -48,8 +48,7 @@ class AutoSession(BaseSession):
         if isinstance(method, GetMe):
             return BOT_USER
         if isinstance(method, GetChat):
-            return ChatFullInfo(id=method.chat_id, type="supergroup", title="Тест-группа",
-                                accent_color_id=0, max_reaction_count=0)
+            return ChatFullInfo.model_construct(id=method.chat_id, type="supergroup", title="Тест-группа")
         if isinstance(method, (SendMessage, EditMessageText, SendDocument)):
             cid = getattr(method, "chat_id", None) or ADMIN
             return Message(message_id=next(_ids), date=now, chat=Chat(id=cid, type="private"),
@@ -217,7 +216,32 @@ async def scenario(dp, bot, db, n, session):
     await dp.feed_update(bot, Update(update_id=next(_ids), my_chat_member=ChatMemberUpdated(
         chat=Chat(id=-999, type="group", title="Чужая"), from_user=user(STRANGER), date=datetime.now(),
         old_chat_member=ChatMemberLeft(user=BOT_USER), new_chat_member=ChatMemberMember(user=BOT_USER))))
-    check(not await db.chat(-999), "посторонний не может прикрепить группу")
+    c999 = await db.chat(-999)
+    check(not c999["is_active"], "посторонний не может прикрепить группу")
+    check(any("Меня добавили в группу «Чужая»" in t for t in sent(session, ADMIN)), "бот не ушёл молча, а спросил админа")
+    await feed(cb(ADMIN, "g:accept:-999"))
+    check((await db.chat(-999))["is_active"], "админ прикрепил группу кнопкой")
+    await feed(cb(ADMIN, "g:off:-999"))
+
+    anon = User(id=1087968824, is_bot=True, first_name="Group", username="GroupAnonymousBot")
+    await dp.feed_update(bot, Update(update_id=next(_ids), my_chat_member=ChatMemberUpdated(
+        chat=Chat(id=-777, type="supergroup", title="Анонимная"), from_user=anon, date=datetime.now(),
+        old_chat_member=ChatMemberLeft(user=BOT_USER), new_chat_member=ChatMemberMember(user=BOT_USER))))
+    check(any("анонимный администратор" in t for t in sent(session, ADMIN)), "анонимный админ → вопрос админам")
+
+    def gmsg(uid, text, chat_id=-555):
+        return Update(update_id=next(_ids), message=Message(
+            message_id=next(_ids), date=datetime.now(), chat=Chat(id=chat_id, type="supergroup", title="Склад"),
+            from_user=user(uid), text=text))
+    session.log.clear()
+    await feed(gmsg(STRANGER, "/bind"))
+    check(not await db.chat(-555) and "только администратор" in sent(session, -555)[-1], "/bind от постороннего отклонён")
+    await feed(gmsg(ADMIN, "/bind@bday_test_bot"))
+    check((await db.chat(-555))["is_active"], "/bind от админа прикрепил группу")
+    await feed(gmsg(ADMIN, "/start@bday_test_bot bday", -556))
+    check((await db.chat(-556))["is_active"], "/start после ссылки «добавить в группу» прикрепил группу")
+    for cid in (-555, -556):
+        await feed(cb(ADMIN, f"g:off:{cid}"))
 
     print("Модерация и публикация")
     await feed(cb(ADMIN, f"ev:re:{ev['id']}"))
